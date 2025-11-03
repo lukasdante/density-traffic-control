@@ -1,7 +1,7 @@
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QToolBar, QMenuBar, QDialog, QLineEdit, QFormLayout, QVBoxLayout, QHBoxLayout, QPushButton,
                                 QMessageBox, QStatusBar, QCheckBox, QGroupBox, QLabel, QFileDialog, QComboBox, QWidget, QSizePolicy, QSplitter,
-                                QDockWidget, QTextEdit, QProgressBar, QListWidget, QListWidgetItem, QScrollArea)
+                                QDockWidget, QTextEdit, QProgressBar, QListWidget, QListWidgetItem, QScrollArea, QSpinBox, QDoubleSpinBox, QSlider,)
 from PySide6.QtCore import Qt, QSize, QRegularExpression, QSettings, QByteArray, QTimer, QDateTime, QFileInfo, Signal, QPoint, QRect 
 from PySide6.QtGui import QIcon, QAction, QIntValidator, QRegularExpressionValidator, QPixmap, QImage, QPainter, QColor, QPen, QPolygonF
 import pyqtgraph as pg
@@ -18,15 +18,22 @@ import numpy as np
 
 asset_path = str(Path(__file__).parent / "assets")
 
+# TODO: Debug ROI info error
+# TODO: Verify camera first before adding to class if it exists
+# TODO: Traffic light logic
+
+# TODO: Tests: tile size, confidence
+
 class MainWindow(QMainWindow):
 
     # Signals -- defined outside init
     display_settings_changed = Signal(dict)
+    experimental_settings_changed = Signal(dict)
     camera_data_changed = Signal(list)
 
     def __init__(self, app: QApplication):
         super().__init__()
-        self.setWindowTitle("TraffIQ-PH Control Panel")
+        self.setWindowTitle("Control Panel")
         self.resize(1500, 900)
         self.app = app
 
@@ -63,6 +70,7 @@ class MainWindow(QMainWindow):
         self.load_all_settings()
 
         self.start_yolo()
+        self._log_message("Initializing YOLO for the first time.", 3000)
 
     def start_yolo(self):
 
@@ -86,18 +94,17 @@ class MainWindow(QMainWindow):
         else:
             target_source = self.cameras
 
-        self.inferencer = Inferencer(self.cam_labels, target_source, self.yolo_stop_flag, self.latency_tracker, self.display_settings)
+        self.inferencer = Inferencer(self.cam_labels, target_source, self.yolo_stop_flag,
+                                     self.latency_tracker, self.display_settings, self.experimental_settings)
         self.yolo_thread = Thread(
             target=self.inferencer.run,
             daemon=True
         )
         self.display_settings_changed.connect(self.inferencer.on_display_settings_changed)
+        self.experimental_settings_changed.connect(self.inferencer.on_experimental_settings_changed)
         self.camera_data_changed.connect(self.inferencer.on_camera_data_changed)
 
-
         self.yolo_thread.start()
-
-        self._log_message("YOLO restarted with updated camera list.", 3000)
 
     def load_layout(self):
         """ Load layout. """
@@ -198,6 +205,31 @@ class MainWindow(QMainWindow):
                 self.display_settings = {}
         else:
             # defaults
+            self.reset_to_default_settings(settings=['display'])
+        
+        # ---- Experimental Settings (future-proof)
+        raw_experimental = self.settings.value("experimental_settings")
+        if raw_experimental:
+            try:
+                self.experimental_settings = json.loads(raw_experimental)
+            except Exception:
+                self.experimental_settings = {}
+        else:
+            self.reset_to_default_settings(settings=['experimental'])
+        # Load layout settings
+        raw_layout = self.settings.value("layout")
+        if raw_layout:
+            try:
+                self.layout_settings = json.loads(raw_layout)
+                self.set_layout()
+            except Exception:
+                self.layout_settings = {}
+        else:
+            self.layout_settings = {}
+
+    def reset_to_default_settings(self, _, settings=['display','experimental','layout']):
+        """ Resets to default settings. """
+        if 'display' in settings:
             self.display_settings = {
                 "bounding_boxes": {
                     "obstructions": True,
@@ -217,30 +249,29 @@ class MainWindow(QMainWindow):
                     "log_level": "Info",
                 }
             }
-        
-        # ---- Experimental Settings (future-proof)
-        raw_experimental = self.settings.value("experimental_settings")
-        if raw_experimental:
-            try:
-                self.experimental_settings = json.loads(raw_experimental)
-            except Exception:
-                self.experimental_settings = {}
-        else:
+
+        if 'experimental' in settings:
             self.experimental_settings = {
-                "notify_officials": True,
                 "use_videos": False,
+                "tile_w": 640,
+                "tile_h": 360,
+                "confidence": 0.30,
             }
         
-        # Load layout settings
-        raw_layout = self.settings.value("layout")
-        if raw_layout:
-            try:
-                self.layout_settings = json.loads(raw_layout)
-                self.set_layout()
-            except Exception:
-                self.layout_settings = {}
-        else:
-            self.layout_settings = {}
+        if 'layout' in settings:
+            self.set_layout(reset=True)
+        
+        if 'cameras' in settings:
+            self.cameras = []
+            self.proxy_cameras = []
+
+        self.save_all_settings()
+        self.load_all_settings()
+
+    def reset_camera(self):
+        self.cameras = []
+
+        self.save_cameras(emit=True)
 
     def save_all_settings(self):
         """ Save all settings to system. """
@@ -298,6 +329,7 @@ class MainWindow(QMainWindow):
             self.proxy_cameras.append(ProxyCamera(**entry))
 
         self.start_yolo()
+        self._log_message("Starting YOLO with new configs.", 3000)
         
 
 
@@ -387,13 +419,14 @@ class MenuBar(QMenuBar):
         # Add menus
         self.addFileMenu()
         self.addViewMenu()
-        self.addHelpMenu()
 
     def addFileMenu(self):
-        self.file_menu = self.addMenu("File")
+        self.file_menu = self.addMenu("Settings")
         load_action = self.file_menu.addAction("Load settings")
         save_action = self.file_menu.addAction("Save settings")
         save_as_action = self.file_menu.addAction("Save settings as")
+        reset_settings_action = self.file_menu.addAction("Reset to default settings")
+        reset_camera_action = self.file_menu.addAction("Reset camera data")
         quit_action = self.file_menu.addAction("Quit")
 
         load_action.setToolTip("Load settings and configurations.")
@@ -402,12 +435,18 @@ class MenuBar(QMenuBar):
         save_action.setStatusTip("Save settings and configurations.")
         save_as_action.setToolTip("Save current settings to a file.")
         save_as_action.setStatusTip("Save current settings to a file.")
+        reset_settings_action.setToolTip("Reset settings to default settings except camera data.")
+        reset_settings_action.setStatusTip("Reset settings to default settings except camera data.")
+        reset_camera_action.setToolTip("Reset camera data.")
+        reset_camera_action.setStatusTip("Reset camera data.")
         quit_action.setToolTip("Quit program.")
         quit_action.setStatusTip("Quit program.")
 
         load_action.triggered.connect(self.parent()._load_configs)
         save_action.triggered.connect(self.parent().save_all_settings)
         save_as_action.triggered.connect(self.parent()._save_as_configs)
+        reset_settings_action.triggered.connect(self.parent().reset_to_default_settings)
+        reset_camera_action.triggered.connect(self.parent().reset_camera)
         quit_action.triggered.connect(self.parent()._quit)
     
     def addViewMenu(self):
@@ -424,9 +463,6 @@ class MenuBar(QMenuBar):
         self.view_menu.addSeparator()
         reset_action = self.view_menu.addAction("Reset layout")
         reset_action.triggered.connect(lambda: self.parent().set_layout(reset=True))
-
-    def addHelpMenu(self):
-        self.help_menu = self.addMenu("Help")
         
 class MainToolBar(QToolBar):
     def __init__(self, parent):
@@ -500,7 +536,7 @@ class MainToolBar(QToolBar):
                 self.parent().proxy_cameras.append(proxy_camera)
                 self.parent().save_cameras()
                 self.parent().start_yolo()
-                self.parent()._log_message("Successfully added proxy camera.", 3000)
+                self.parent()._log_message("YOLO restarted with updated camera list.", 3000)
 
                 print(f"Proxy camera '{proxy_camera.name}' added successfully.")
         else:
@@ -511,7 +547,7 @@ class MainToolBar(QToolBar):
                 self.parent().cameras.append(camera) # add current camera to cameras
                 self.parent().save_cameras() # save cameras persistently
                 self.parent().start_yolo()
-                self.parent()._log_message("Successfully added camera.", 3000)
+                self.parent()._log_message("YOLO restarted with updated camera list.", 3000)
                 print(f"Camera added: {camera}")
 
     def _remove_source(self):
@@ -544,7 +580,6 @@ class MainToolBar(QToolBar):
 
             # --- Restart YOLO backend ---
             self.parent().start_yolo()
-
             self.parent()._log_message("Selected source(s) removed and YOLO restarted.", 3000)
 
 
@@ -573,7 +608,6 @@ class MainToolBar(QToolBar):
     def _change_experimental_settings(self):
         """
         Features:
-            1. Notify officials for possible obstructions.
             2. Checkbox of shown bounding boxes. 
             3. Use other models?
             5. Use videos for demonstration.
@@ -584,12 +618,13 @@ class MainToolBar(QToolBar):
 
         if dialog.exec():
             settings = dialog.get_settings()
-            previous_settings = self.parent().experimental_settings["use_videos"]
             self.parent().experimental_settings = settings
-            if settings["use_videos"] != previous_settings: self.parent().start_yolo()
-            self.parent().save_all_settings()
-            self.parent()._log_message("Updated experimental settings", 3000)
+            self.parent().save_all_settings()            
+            self.parent()._log_message("Restarting YOLO with updated experimental settings", 3000)
+            self.parent().start_yolo()
             print("User settings:", settings)
+
+            self.parent().experimental_settings_changed.emit(self.parent().experimental_settings)
 
 class StatusBar(QStatusBar):
     def __init__(self, parent):
@@ -1203,9 +1238,8 @@ class ROICanvas(QWidget):
 
 class ChangeExperimentalSettingsDialog(QDialog):
     """
-        1. Notify officials through email.
-        2. Use videos for demonstration.
-
+        1. Use videos for demonstration.
+        2. Adjust tile width and height.
     """
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1219,11 +1253,56 @@ class ChangeExperimentalSettingsDialog(QDialog):
         settings_layout = QVBoxLayout()
         settings_layout.addWidget(QLabel("Configure experimental settings:"))
 
-        self.cb_notify = QCheckBox("Notify officials for possible obstructions.")
         self.cb_use_videos = QCheckBox("Use videos instead for demonstration purposes.")
-
-        settings_layout.addWidget(self.cb_notify)
         settings_layout.addWidget(self.cb_use_videos)
+
+        # --- Tile Settings ---
+        settings_layout.addSpacing(10)
+        tile_layout = QVBoxLayout()
+
+        tile_layout.addWidget(QLabel("Tile Width:"))
+        self.set_tile_w = QSpinBox()
+        self.set_tile_w.setRange(640, 3840)
+        self.set_tile_w.setValue(1280)
+        tile_layout.addWidget(self.set_tile_w)
+
+        tile_layout.addWidget(QLabel("Tile Height:"))
+        self.set_tile_h = QSpinBox()
+        self.set_tile_h.setRange(360, 2160)
+        self.set_tile_h.setValue(720)
+        tile_layout.addWidget(self.set_tile_h)
+        tile_layout.addSpacing(10)
+
+
+        # Inside your layout setup
+        confidence_layout = QHBoxLayout()
+        confidence_layout.addWidget(QLabel("Model confidence:"))
+
+        # Slider setup (0–100 mapped to 0.0–1.0)
+        self.slider_conf = QSlider(Qt.Horizontal)
+        self.slider_conf.setRange(0, 100)
+        self.slider_conf.setValue(30)
+        confidence_layout.addWidget(self.slider_conf)
+
+        # Double spinbox setup (0.00–1.00)
+        self.spin_conf = QDoubleSpinBox()
+        self.spin_conf.setRange(0.0, 1.0)
+        self.spin_conf.setDecimals(2)
+        self.spin_conf.setSingleStep(0.01)
+        self.spin_conf.setValue(0.30)
+        confidence_layout.addWidget(self.spin_conf)
+
+        # --- Synchronize both widgets ---
+        self.slider_conf.valueChanged.connect(
+            lambda v: self.spin_conf.setValue(v / 100)
+        )
+        self.spin_conf.valueChanged.connect(
+            lambda v: self.slider_conf.setValue(int(v * 100))
+        )
+
+        tile_layout.addLayout(confidence_layout)
+
+        settings_layout.addLayout(tile_layout)
 
         settings_group.setLayout(settings_layout)
         main_layout.addWidget(settings_group)
@@ -1245,14 +1324,18 @@ class ChangeExperimentalSettingsDialog(QDialog):
     def get_settings(self):
         """Return the chosen settings as a dict"""
         return {
-            "notify_officials": self.cb_notify.isChecked(),
-            "use_videos": self.cb_use_videos.isChecked()
+            "use_videos": self.cb_use_videos.isChecked(),
+            "tile_w": self.set_tile_w.value(),
+            "tile_h": self.set_tile_h.value(),
+            "confidence": self.spin_conf.value(),
         }
     
     def set_settings(self, settings: dict):
         # back here
-        self.cb_notify.setChecked(settings.get("notify_officials", False))
         self.cb_use_videos.setChecked(settings.get("use_videos", False))
+        self.set_tile_w.setValue(settings.get("tile_w", 640))
+        self.set_tile_h.setValue(settings.get("tile_h", 360))
+        self.spin_conf.setValue(settings.get("confidence", 0.30))
 
 class CameraWidget(QSplitter):
     def __init__(self, parent=None):
@@ -1393,8 +1476,8 @@ class MetricsWidget(QWidget):
 
         summary = self.parent().parent().latency_tracker.summary()
         
-        if summary["total"]:
-            fps = len(self.parent().parent().cameras) or len(self.parent().parent().proxy_cameras) / summary['total']
+        if summary["total"] > 0:
+            fps = 1.0 / summary["total"]     # correct FPS computation
             self.fps_label.setText(f"{fps:.1f}")
         self.latency_total.setText(f"{summary['total']*1000:.1f} ms")
         self.latency_camera.setText(f"{summary['capture']*1000:.1f} ms")

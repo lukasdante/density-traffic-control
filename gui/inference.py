@@ -23,8 +23,10 @@ from publisher import publish
 
 # --- CONFIG ---
 MODEL_PATH = str(Path(__file__).parent.parent / "yolo" / "best.pt")  # adjust to your model
+MODEL_PATH = "yolo11n.pt"
 WINDOW = "YOLO 2x2 (low-latency)"
 TILE_W, TILE_H = 640, 360
+CONFIDENCE = 0.30
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 # Draw settings
@@ -75,12 +77,17 @@ class Cam:
     alive: bool = True
 
 class Inferencer:
-    def __init__(self, label_widgets, target_sources, stop_flag, latency_tracker, display_settings):
+    def __init__(self, label_widgets, target_sources, stop_flag, latency_tracker, display_settings, experimental_settings):
         self.label_widgets = label_widgets
         self.target_sources = target_sources
         self.stop_flag = stop_flag
         self.latency_tracker = latency_tracker
         self.display_settings = display_settings
+        self.experimental_settings = experimental_settings
+
+        self.tile_w = self.experimental_settings.get("tile_w", TILE_W)
+        self.tile_h = self.experimental_settings.get("tile_h", TILE_H)
+        self.confidence = self.experimental_settings.get("confidence", CONFIDENCE)
 
         self.cycle_green = 15
         self.cycle_yellow = 3
@@ -276,10 +283,10 @@ class Inferencer:
         inf_start = time.perf_counter()
         preds = model.predict(
             valid_imgs,
-            imgsz=max(TILE_W, TILE_H),
+            imgsz=max(self.tile_w, self.tile_h),
             device=device,
             half=(device != "cpu"),
-            conf=0.5,
+            conf=self.confidence,
             iou=0.45,
             verbose=False
         )
@@ -396,7 +403,7 @@ class Inferencer:
 
         # --- Compute scale relative to reference resolution ---
         # Reference = 1280x720; change to your usual baseline
-        base_w, base_h = TILE_W, TILE_H
+        base_w, base_h = self.tile_w, self.tile_h
         scale_factor = ((w / base_w) + (h / base_h)) / 2.0  # geometric mean works too
 
         # --- Adjustable visual parameters scaled ---
@@ -485,6 +492,11 @@ class Inferencer:
         self.display_settings = display_dict.copy()
         print(f"[INFO] OSD settings updated: {self.display_settings}")
     
+    @Slot(dict)
+    def on_experimental_settings_changed(self, experimental_dict):
+        self.experimental_settings = experimental_dict.copy()
+        print(f"[INFO] Inference settings updated: {self.experimental_settings}")
+    
     @Slot(list)
     def on_camera_data_changed(self, new_cameras):
         """Update camera source list without restarting inference."""
@@ -523,7 +535,7 @@ class Inferencer:
                         ret, frame = cap.read()
                     
                     if ret and frame is not None:
-                        frame = cv2.resize(frame, (TILE_W, TILE_H), interpolation=cv2.INTER_AREA)
+                        frame = cv2.resize(frame, (self.tile_w, self.tile_h), interpolation=cv2.INTER_AREA)
 
                     frames.append(frame)
                 self.latency_tracker.record_capture(time.perf_counter() - capture_start)
@@ -550,7 +562,7 @@ class Inferencer:
         cams = []
 
         for cam in self.target_sources:
-            cap = GstCam(self.build_pipeline(cam.full_link, TILE_W, TILE_H))
+            cap = GstCam(self.build_pipeline(cam.full_link, self.tile_w, self.tile_h))
             cam = Cam(url=cam.full_link, cap=cap, q=queue.Queue(maxsize=1))
             t = threading.Thread(target=self.reader_thread, args=(cam,), daemon=True)
             t.start()
