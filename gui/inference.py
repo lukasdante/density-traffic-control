@@ -270,14 +270,22 @@ class Inferencer:
         return cropped_imgs, roi_info
 
 
-    def _batch_infer(self, model, batch_imgs, device):
+    def _batch_infer(self, model, batch_imgs, device, idx_map):
         """Run YOLO strictly within each camera's ROI only."""
-        # Crop first
-        cropped_imgs, self._roi_info = self._prepare_roi_crops(batch_imgs)
+        roi_info_list = []
+        self._roi_info_by_frame = {}
+        self._result_index_by_frame = {}
+
+        # Crop first (per valid frame)
+        cropped_imgs, roi_info_list = self._prepare_roi_crops(batch_imgs)
+        self._roi_info_by_frame = {frame_idx: info for frame_idx, info in zip(idx_map, roi_info_list)}
+        self._result_index_by_frame = {frame_idx: local_idx for local_idx, frame_idx in enumerate(idx_map)}
 
         # Remove None frames (keeps batch clean)
         valid_imgs = [img for img in cropped_imgs if img is not None]
         if not valid_imgs:
+            self._latest_velocities = {}
+            self._latest_obstructions = {}
             return []
 
         inf_start = time.perf_counter()
@@ -292,20 +300,18 @@ class Inferencer:
         )
         self.latency_tracker.record_inference(time.perf_counter() - inf_start)
 
-            # ---- Build full-frame boxes for tracking ----
+        # ---- Build full-frame boxes for tracking ----
         frame_time = time.time()
         all_boxes_xyxy = []  # flatten across the valid frames (your display code already remaps by index)
-        valid_idx = 0
-        for i in range(len(batch_imgs)):
-            # each 'i' corresponds to frames; guard because you only predicted on valid ones
-            if batch_imgs[i] is None:
-                continue
-            r = preds[valid_idx]
-            valid_idx += 1
+
+        for local_idx, frame_idx in enumerate(idx_map):
+            if local_idx >= len(preds):
+                break
+            r = preds[local_idx]
             if r.boxes is not None and len(r.boxes) > 0:
                 xyxy = r.boxes.xyxy.cpu().numpy()
                 # shift back to full-frame coords using stored ROI offsets
-                x_off, y_off, _, _ = self._roi_info[i]
+                x_off, y_off, _, _ = self._roi_info_by_frame.get(frame_idx, (0, 0, 0, 0))
                 if xyxy.size > 0:
                     xyxy[:, [0, 2]] += x_off
                     xyxy[:, [1, 3]] += y_off
@@ -330,23 +336,22 @@ class Inferencer:
         """Draw bounding boxes and OSD text per frame after ROI-only inference."""
         display_start = time.perf_counter()
 
+        roi_info_map = getattr(self, "_roi_info_by_frame", {})
+        result_idx_map = getattr(self, "_result_index_by_frame", {})
+
         if results:
             class_names = results[0].names
-            valid_idx = 0  # results correspond only to valid ROI frames
 
             for i, frame in enumerate(frames):
                 if frame is None:
                     continue
 
-                # --- ROI offset info ---
-                x_off, y_off, _, _ = self._roi_info[i]
                 num_objs = 0
 
-                # --- Match YOLO output to this frame ---
-                if valid_idx < len(results):
-                    r = results[valid_idx]
-                    valid_idx += 1
-
+                result_idx = result_idx_map.get(i)
+                if result_idx is not None and result_idx < len(results):
+                    r = results[result_idx]
+                    x_off, y_off, _, _ = roi_info_map.get(i, (0, 0, 0, 0))
                     if r.boxes is not None and len(r.boxes) > 0:
                         xyxy = r.boxes.xyxy.cpu().numpy()
                         conf = r.boxes.conf.unsqueeze(1).cpu().numpy()
@@ -548,7 +553,7 @@ class Inferencer:
 
                 results = []
                 if batch_imgs:
-                    results = self._batch_infer(model, batch_imgs, device)
+                    results = self._batch_infer(model, batch_imgs, device, idx_map)
 
                 self._display_frames(frames, results, idx_map)
 
@@ -590,7 +595,7 @@ class Inferencer:
 
                 # Batch infer
                 if batch_imgs:
-                    results = self._batch_infer(model, batch_imgs, device)
+                    results = self._batch_infer(model, batch_imgs, device, idx_map)
                 
                 self._display_frames(frames, results, idx_map)
 
