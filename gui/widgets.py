@@ -14,15 +14,13 @@ from threading import Thread, Event
 
 from inference import Inferencer
 from classes import Camera, LatencyTracker, ProxyCamera
-import numpy as np
 
 asset_path = str(Path(__file__).parent / "assets")
 
-# TODO: Debug ROI info error
 # TODO: Verify camera first before adding to class if it exists
 # TODO: Traffic light logic
-
-# TODO: Tests: tile size, confidence
+# TODO: SORT tracking
+# TODO: Camera D lags always....
 
 class MainWindow(QMainWindow):
 
@@ -177,6 +175,7 @@ class MainWindow(QMainWindow):
                 data = json.loads(raw_proxies)
                 self.proxy_cameras.clear()
                 for entry in data:
+                    entry.setdefault("direction", "vertical")
                     cam = ProxyCamera(**entry)
                     self.proxy_cameras.append(cam)
                 print(f"Loaded {len(self.proxy_cameras)} proxy cameras from the system.")
@@ -190,6 +189,7 @@ class MainWindow(QMainWindow):
                 data = json.loads(raw_cams)
                 self.cameras.clear()
                 for entry in data:
+                    entry.setdefault("direction", "vertical")
                     cam = Camera(**entry)
                     self.cameras.append(cam)
                 print(f"Loaded {len(self.cameras)} cameras from the system.")
@@ -232,10 +232,9 @@ class MainWindow(QMainWindow):
         if 'display' in settings:
             self.display_settings = {
                 "bounding_boxes": {
-                    "obstructions": True,
-                    "two-wheeled": True,
-                    "light": True,
-                    "heavy": True,
+                    "firetruck": True,
+                    "ambulance": True,
+                    "vehicle": True,
                 },
                 "osd": {
                     "name": True,
@@ -647,6 +646,8 @@ class AddSourceDialog(QDialog):
         self.password_edit = QLineEdit()
         self.location_edit = QLineEdit()
         self.max_cap_edit = QLineEdit()
+        self.direction_combo = QComboBox()
+        self.direction_combo.addItems(["Vertical", "Horizontal"])
         self.line_edit_fields: list[QLineEdit] = [self.name_edit, self.address_edit, self.username_edit, self.port_edit,
                                  self.channel_edit, self.password_edit, self.location_edit, self.max_cap_edit]
 
@@ -672,6 +673,7 @@ class AddSourceDialog(QDialog):
         layout.addRow("Password:", self.password_edit)
         layout.addRow("RTSP Port:", self.port_edit)
         layout.addRow("Channel:", self.channel_edit)
+        layout.addRow("Direction:", self.direction_combo)
         
         
 
@@ -704,6 +706,7 @@ class AddSourceDialog(QDialog):
             "channel": int(self.channel_edit.text().strip()),
             "location": self.location_edit.text().strip(),
             "max_cap": self.max_cap_edit.text().strip(),
+            "direction": self.direction_combo.currentText().lower(),
         }
     
 class RemoveSourceDialog(QDialog):
@@ -831,6 +834,11 @@ class AddVideoSourceDialog(QDialog):
         self.max_cap_edit = QLineEdit()
         form_layout.addRow("Max cap:", self.max_cap_edit)
 
+        # Direction dropdown
+        self.direction_combo = QComboBox()
+        self.direction_combo.addItems(["Vertical", "Horizontal"])
+        form_layout.addRow("Direction:", self.direction_combo)
+
         # File picker
         file_layout = QHBoxLayout()
         self.file_edit = QLineEdit()
@@ -885,6 +893,7 @@ class AddVideoSourceDialog(QDialog):
             "location": self.location_edit.text().strip(),
             "file_path": self.file_edit.text().strip(),
             "max_cap": self.max_cap_edit.text().strip(),
+            "direction": self.direction_combo.currentText().lower(),
         }
 
 class ChangeDisplaySettingsDialog(QDialog):
@@ -900,15 +909,13 @@ class ChangeDisplaySettingsDialog(QDialog):
         bbox_layout = QVBoxLayout()
         bbox_layout.addWidget(QLabel("Choose which bounding boxes to show:"))
 
-        self.cb_obstructions = QCheckBox("Obstructions")
-        self.cb_two_wheeled = QCheckBox("Two-wheeled vehicles")
-        self.cb_light = QCheckBox("Light vehicles")
-        self.cb_heavy = QCheckBox("Heavy vehicles")
+        self.cb_firetruck = QCheckBox("Firetrucks")
+        self.cb_ambulance = QCheckBox("Ambulances")
+        self.cb_vehicle = QCheckBox("Vehicles")
 
-        bbox_layout.addWidget(self.cb_obstructions)
-        bbox_layout.addWidget(self.cb_two_wheeled)
-        bbox_layout.addWidget(self.cb_light)
-        bbox_layout.addWidget(self.cb_heavy)
+        bbox_layout.addWidget(self.cb_firetruck)
+        bbox_layout.addWidget(self.cb_ambulance)
+        bbox_layout.addWidget(self.cb_vehicle)
 
         bbox_group.setLayout(bbox_layout)
         main_layout.addWidget(bbox_group)
@@ -965,10 +972,9 @@ class ChangeDisplaySettingsDialog(QDialog):
         """Return the chosen settings as a dict"""
         return {
             "bounding_boxes": {
-                "obstructions": self.cb_obstructions.isChecked(),
-                "two-wheeled": self.cb_two_wheeled.isChecked(),
-                "light": self.cb_light.isChecked(),
-                "heavy": self.cb_heavy.isChecked(),
+                "firetruck": self.cb_firetruck.isChecked(),
+                "ambulance": self.cb_ambulance.isChecked(),
+                "vehicle": self.cb_vehicle.isChecked(),
             },
             "osd": {
                 "name": self.cb_name.isChecked(),
@@ -988,10 +994,9 @@ class ChangeDisplaySettingsDialog(QDialog):
         osd = settings.get("osd", {})
         logs = settings.get("logs", {})
 
-        self.cb_obstructions.setChecked(bb.get("obstructions", False))
-        self.cb_two_wheeled.setChecked(bb.get("two-wheeled", False))
-        self.cb_light.setChecked(bb.get("light", False))
-        self.cb_heavy.setChecked(bb.get("heavy", False))
+        self.cb_firetruck.setChecked(bb.get("firetruck", False))
+        self.cb_ambulance.setChecked(bb.get("ambulance", False))
+        self.cb_vehicle.setChecked(bb.get("vehicle", False))
 
         self.cb_name.setChecked(osd.get("name", False))
         self.cb_location.setChecked(osd.get("location", False))

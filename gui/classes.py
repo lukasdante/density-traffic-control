@@ -17,6 +17,7 @@ class Camera(BaseCamera):
     password: str
     rtsp_port: int
     channel: int
+    direction: Literal["vertical", "horizontal"] = "vertical"
     roi: tuple[int, int, int] | None = None
     
     def __post_init__(self):
@@ -28,6 +29,7 @@ class Camera(BaseCamera):
 @dataclass
 class ProxyCamera(BaseCamera):
     file_path: str
+    direction: Literal["vertical", "horizontal"] = "vertical"
     roi: tuple[int, int, int] | None = None
 
 

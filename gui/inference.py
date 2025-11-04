@@ -18,7 +18,6 @@ from PySide6.QtCore import Qt, Slot
 import torch
 from ultralytics import YOLO
 from classes import Camera, ProxyCamera
-from trackers import CentroidObstructionTracker
 from publisher import publish
 
 # --- CONFIG ---
@@ -97,17 +96,6 @@ class Inferencer:
         self.last_green_lane = None
         self.lanes = ["A", "B", "C", "D"]
 
-        self.tracker = CentroidObstructionTracker(
-            alpha=0.30,          # v_i < 0.30 * mean_v  -> suspect
-            hold_time=3.0,       # seconds below threshold to declare obstruction
-            fps_hint=30.0,
-            iou_thresh=0.3,
-            dist_thresh=80.0,
-            max_miss_time=1.5,
-            H=None,              # <-- set your 3x3 homography here when ready
-            scale_mpp=0.05       # fallback if H is None
-        )
-
     def build_pipeline(self, rtsp_url: str, w: int | None = None, h: int | None = None) -> str:
         size_caps = ""
         if w and h:
@@ -165,10 +153,9 @@ class Inferencer:
 
         bbox_settings = self.display_settings.get("bounding_boxes", {})
         CLASS_COLORS = {
-            "obstructions": (0, 165, 255),   # Orange
-            "two-wheeled":  (0, 255, 255),   # Yellow
-            "light":        (0, 255, 0),     # Green
-            "heavy":        (255, 0, 255),   # Purple
+            "firetruck": (0, 0, 255),
+            "ambulance": (0, 255, 255),
+            "vehicle": (0, 255, 0),
         }
             # --- Get current frame dimensions (O(1) operation) ---
         h, w = frame.shape[:2]
@@ -187,7 +174,7 @@ class Inferencer:
             cls = int(cls)
             name = class_names[cls] if cls < len(class_names) else f"cls_{cls}"
             
-            if not bbox_settings.get(name, True):
+            if not bbox_settings.get(name, False):
                 continue
 
             color = CLASS_COLORS.get(name, (255, 255, 255))  # default white
@@ -284,8 +271,6 @@ class Inferencer:
         # Remove None frames (keeps batch clean)
         valid_imgs = [img for img in cropped_imgs if img is not None]
         if not valid_imgs:
-            self._latest_velocities = {}
-            self._latest_obstructions = {}
             return []
 
         inf_start = time.perf_counter()
@@ -300,10 +285,6 @@ class Inferencer:
         )
         self.latency_tracker.record_inference(time.perf_counter() - inf_start)
 
-        # ---- Build full-frame boxes for tracking ----
-        frame_time = time.time()
-        all_boxes_xyxy = []  # flatten across the valid frames (your display code already remaps by index)
-
         for local_idx, frame_idx in enumerate(idx_map):
             if local_idx >= len(preds):
                 break
@@ -315,20 +296,6 @@ class Inferencer:
                 if xyxy.size > 0:
                     xyxy[:, [0, 2]] += x_off
                     xyxy[:, [1, 3]] += y_off
-                    for box in xyxy:
-                        all_boxes_xyxy.append(box.tolist())
-
-        # ---- Update tracker with all full-frame detections this cycle ----
-        tracks_state = self.tracker.update(all_boxes_xyxy, frame_time)
-        # Optionally keep latest summaries for drawing elsewhere
-        self._latest_velocities = self.tracker.latest_velocities
-        self._latest_obstructions = self.tracker.latest_obstructions
-
-        # Print only those declared as obstructions
-        for tid, is_obstructed in self.tracker.latest_obstructions.items():
-            if is_obstructed:
-                v = self.tracker.latest_velocities.get(tid, float("nan"))
-                print(f"[OBSTRUCTION] Track {tid} velocity={v:.2f} m/s")
 
         return preds
 
@@ -364,7 +331,6 @@ class Inferencer:
 
                         # Draw boxes
                         frame = self.draw_boxes(frame, boxes, class_names)
-                        frame = self.draw_obstruction(frame)
                         num_objs = len(r.boxes.cls)
 
                 # --- Draw OSD ---
@@ -436,57 +402,60 @@ class Inferencer:
             except (ValueError, TypeError):
                 max_cap = 100
             congestion_ratio = num_objs / max_cap if max_cap > 0 else 0
-            lines.append(f"Congestion: {congestion_ratio:.2f}")
+            lines.append(f"Congestion: {congestion_ratio:.2f} ({num_objs} vehicles)")
         
         if hasattr(cam, "roi") and cam.roi is not None and osd.get("roi", False):
             h, w, _ = frame.shape
             pts = np.array([(int(x*w), int(y*h)) for x, y in cam.roi], dtype=np.int32)
             cv2.polylines(frame, [pts], isClosed=True, color=(255, 0, 0), thickness=2)
 
-        if not lines:
+        draw_signal = osd.get("traffic_phase", False)
+
+        if not lines and not draw_signal:
             return frame
 
-        # --- Dynamic rectangle size ---
-        text_widths = [cv2.getTextSize(t, font, scale, thickness)[0][0] for t in lines]
-        rect_width = padding * 2 + max(text_widths)
-        rect_height = padding * 2 + line_h * len(lines)
+        if lines:
+            # --- Dynamic rectangle size ---
+            text_widths = [cv2.getTextSize(t, font, scale, thickness)[0][0] for t in lines]
+            rect_width = padding * 2 + max(text_widths)
+            rect_height = padding * 2 + line_h * len(lines)
 
-        # --- Translucent background ---
-        overlay = frame.copy()
-        cv2.rectangle(
-            overlay,
-            (margin_x, margin_y),
-            (margin_x + rect_width, margin_y + rect_height),
-            bg_color,
-            -1
-        )
-        frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
-
-        # --- Draw text lines ---
-        y = margin_y + padding + int(line_h * 0.8)
-        for text in lines:
-            cv2.putText(
-                frame, text,
-                (margin_x + padding, y),
-                font, scale, color, thickness, cv2.LINE_AA
+            # --- Translucent background ---
+            overlay = frame.copy()
+            cv2.rectangle(
+                overlay,
+                (margin_x, margin_y),
+                (margin_x + rect_width, margin_y + rect_height),
+                bg_color,
+                -1
             )
-            y += line_h
-        
+            frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
 
-        # --- Traffic Signal (top-right corner) ---
-        radius = int(15 * scale_factor)
-        gap = int(8 * scale_factor)
-        x_right = w - margin_x - radius
-        y_top = margin_y + radius + 5
+            # --- Draw text lines ---
+            y = margin_y + padding + int(line_h * 0.8)
+            for text in lines:
+                cv2.putText(
+                    frame, text,
+                    (margin_x + padding, y),
+                    font, scale, color, thickness, cv2.LINE_AA
+                )
+                y += line_h
 
-        signal = self._get_signal_state(cam)
-        colors = {"red": (0, 0, 255), "yellow": (0, 255, 255), "green": (0, 255, 0)}
+        if draw_signal:
+            # --- Traffic Signal (top-right corner) ---
+            radius = int(15 * scale_factor)
+            gap = int(8 * scale_factor)
+            x_right = w - margin_x - radius
+            y_top = margin_y + radius + 5
 
-        for i, c in enumerate(["red", "yellow", "green"]):
-            cy = y_top + i * (2 * radius + gap)
-            circle_color = colors[c] if signal == c else (80, 80, 80)
-            cv2.circle(frame, (x_right, cy), radius, circle_color, -1)
-            cv2.circle(frame, (x_right, cy), radius, (0, 0, 0), 2)
+            signal = self._get_signal_state(cam)
+            colors = {"red": (0, 0, 255), "yellow": (0, 255, 255), "green": (0, 255, 0)}
+
+            for i, c in enumerate(["red", "yellow", "green"]):
+                cy = y_top + i * (2 * radius + gap)
+                circle_color = colors[c] if signal == c else (80, 80, 80)
+                cv2.circle(frame, (x_right, cy), radius, circle_color, -1)
+                cv2.circle(frame, (x_right, cy), radius, (0, 0, 0), 2)
 
 
         return frame
@@ -606,56 +575,6 @@ class Inferencer:
                     cam.cap.release()
                 except Exception:
                     pass
-    def draw_obstruction(self, frame):
-        """
-        Draw bounding boxes for current obstructions detected by the tracker.
-
-        Parameters
-        ----------
-        frame : np.ndarray
-            The video frame to draw on (BGR).
-
-        Returns
-        -------
-        np.ndarray
-            The frame with obstruction boxes drawn.
-        """
-        if not hasattr(self, "_latest_obstructions"):
-            return frame
-        if not self._latest_obstructions:
-            return frame
-
-        # Scale-based sizing
-        h, w = frame.shape[:2]
-        base_w, base_h = 1280, 720
-        scale = ((w / base_w) + (h / base_h)) / 2.0
-        font_scale = 0.6 * scale
-        thickness = max(2, int(1.2 * scale))
-        text_thickness = max(1, int(1.2 * scale))
-        padding = int(3 * scale)
-
-        for tid, is_obstruction in self._latest_obstructions.items():
-            if not is_obstruction:
-                continue
-            tr = self.tracker._tracks.get(tid)
-            if not tr:
-                continue
-
-            x1, y1, x2, y2 = map(int, tr["box"])
-            color = (0, 165, 255)  # Orange
-            label = "OBSTRUCTION"
-
-            # Draw box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-
-            # Draw label background
-            (tw, th), _ = cv2.getTextSize(label, FONT, font_scale, text_thickness)
-            cv2.rectangle(frame, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), color, -1)
-            cv2.putText(frame, label, (x1 + padding, max(0, y1 - padding)),
-                        FONT, font_scale, (0, 0, 0), text_thickness, cv2.LINE_AA)
-
-        return frame
-
     def _get_signal_state(self, cam):
         """
         Determine the light color (green/yellow/red) based on the rotating lane cycle.
