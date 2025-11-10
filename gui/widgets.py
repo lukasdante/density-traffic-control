@@ -20,7 +20,6 @@ asset_path = str(Path(__file__).parent / "assets")
 # TODO: Verify camera first before adding to class if it exists
 # TODO: Traffic light logic
 # TODO: SORT tracking
-# TODO: Camera D lags always....
 
 class MainWindow(QMainWindow):
 
@@ -363,7 +362,7 @@ class MainWindow(QMainWindow):
         with open(path, "w") as f:
             json.dump(payload, f, indent=4)
         
-        self._log_message(f"Successfully saved settings to {path}.")
+        self._log_message(f"Successfully saved settings to {path}.", 2000)
 
     def _save_current_layout(self):
         self._default_geometry = self.saveGeometry()
@@ -749,7 +748,7 @@ class RemoveSourceDialog(QDialog):
 
         # populate proxy list
         for i, proxy in enumerate(self.parent_window.proxy_cameras):
-            item_text = f"{i+1}. {proxy.name} — {proxy.file_path} ({proxy.location})"
+            item_text = f"{i+1}. [{proxy.direction[0].upper()}] {proxy.name} — {proxy.file_path} ({proxy.location})"
             item = QListWidgetItem(item_text)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Unchecked)

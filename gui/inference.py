@@ -21,12 +21,13 @@ from classes import Camera, ProxyCamera
 from publisher import publish
 
 # --- CONFIG ---
-MODEL_PATH = str(Path(__file__).parent.parent / "yolo" / "best.pt")  # adjust to your model
-MODEL_PATH = "yolo11n.pt"
+MODEL_PATH = str(Path(__file__).parent.parent / "model" / "runs" / "yolo11-vehicles2" / "weights" / "best.pt")
 WINDOW = "YOLO 2x2 (low-latency)"
 TILE_W, TILE_H = 640, 360
 CONFIDENCE = 0.30
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+MIN_GREEN = 15
+MAX_GREEN = 85
 
 # Draw settings
 DRAW_THICKNESS = 2
@@ -87,14 +88,18 @@ class Inferencer:
         self.tile_w = self.experimental_settings.get("tile_w", TILE_W)
         self.tile_h = self.experimental_settings.get("tile_h", TILE_H)
         self.confidence = self.experimental_settings.get("confidence", CONFIDENCE)
-
-        self.cycle_green = 15
-        self.cycle_yellow = 3
-        self.total_cycle = (self.cycle_green + self.cycle_yellow) * len(self.target_sources)
-        self.start_time = time.time()
-
-        self.last_green_lane = None
-        self.lanes = ["A", "B", "C", "D"]
+        self.min_green_time = MIN_GREEN
+        self.max_green_time = MAX_GREEN
+        self.current_green_lane: Optional[str] = None
+        self.last_switch_time = time.time()
+        self.last_published_red_lane: Optional[str] = None
+        self._last_vehicle_counts = {"horizontal": 0, "vertical": 0}
+        self._vehicle_class_ids: set[int] = set()
+        self._has_vehicle_measurement = False
+        self.yellow_duration = 3.0
+        self._yellow_until = {"horizontal": 0.0, "vertical": 0.0}
+        self._pending_lane: Optional[str] = None
+        self._pending_start_time = 0.0
 
     def build_pipeline(self, rtsp_url: str, w: int | None = None, h: int | None = None) -> str:
         size_caps = ""
@@ -358,6 +363,140 @@ class Inferencer:
         # --- Record latency ---
         self.latency_tracker.record_display(time.perf_counter() - display_start)
 
+    def _extract_vehicle_class_ids(self, names) -> set[int]:
+        vehicle_ids: set[int] = set()
+        if isinstance(names, dict):
+            items = names.items()
+        elif isinstance(names, (list, tuple)):
+            items = enumerate(names)
+        else:
+            items = []
+
+        for idx, label in items:
+            try:
+                key = int(idx)
+            except (TypeError, ValueError):
+                continue
+            if label == "vehicle":
+                vehicle_ids.add(key)
+        return vehicle_ids
+
+    def _aggregate_vehicle_counts(self, results, idx_map):
+        counts = {"horizontal": 0, "vertical": 0}
+        if not idx_map or not results:
+            return counts
+
+        if not self._vehicle_class_ids and results:
+            names = getattr(results[0], "names", {})
+            self._vehicle_class_ids = self._extract_vehicle_class_ids(names)
+
+        if not self._vehicle_class_ids:
+            return counts
+
+        vehicle_class_ids = np.array(list(self._vehicle_class_ids))
+
+        for local_idx, frame_idx in enumerate(idx_map):
+            if local_idx >= len(results):
+                break
+            result = results[local_idx]
+            boxes = getattr(result, "boxes", None)
+            if boxes is None or boxes.cls is None or boxes.cls.numel() == 0:
+                continue
+
+            cls_tensor = boxes.cls.detach().to("cpu").numpy()
+            if cls_tensor.size == 0:
+                continue
+
+            vehicle_mask = np.isin(cls_tensor.astype(int), vehicle_class_ids)
+            vehicle_count = int(np.count_nonzero(vehicle_mask))
+            if vehicle_count == 0:
+                continue
+
+            direction = getattr(self.target_sources[frame_idx], "direction", "vertical")
+            direction = direction if direction in ("horizontal", "vertical") else "vertical"
+            counts[direction] += vehicle_count
+
+        return counts
+
+    def _preferred_green_lane(self, vehicle_counts):
+        horizontal = vehicle_counts.get("horizontal", 0)
+        vertical = vehicle_counts.get("vertical", 0)
+
+        if horizontal > vertical:
+            return "horizontal"
+        if vertical > horizontal:
+            return "vertical"
+        return None
+
+    def _opposite_lane(self, lane: Optional[str]) -> Optional[str]:
+        if lane == "horizontal":
+            return "vertical"
+        if lane == "vertical":
+            return "horizontal"
+        return None
+
+    def _publish_red(self, lane: Optional[str], show_yellow: bool = True):
+        if not lane:
+            return
+        if show_yellow:
+            self._yellow_until[lane] = time.time() + self.yellow_duration
+        else:
+            self._yellow_until[lane] = 0.0
+        try:
+            publish(lane)
+            self.last_published_red_lane = lane
+        except Exception as exc:
+            print(f"[ERROR] MQTT publish failed for lane {lane}: {exc}")
+
+    def _schedule_lane_change(self, target_lane: Optional[str], now: float):
+        if not target_lane or target_lane not in ("horizontal", "vertical"):
+            return
+        if self._pending_lane:
+            return
+        losing_lane = self._opposite_lane(target_lane)
+        if losing_lane:
+            self._publish_red(losing_lane, show_yellow=True)
+        self.current_green_lane = None
+        self._pending_lane = target_lane
+        self._pending_start_time = now + self.yellow_duration
+
+    def _update_signal_state(self, vehicle_counts):
+        now = time.time()
+        preferred_lane = self._preferred_green_lane(vehicle_counts)
+
+        if self.current_green_lane is None and self._pending_lane is None and not self._has_vehicle_measurement:
+            return
+
+        if self._pending_lane:
+            if now >= self._pending_start_time:
+                self.current_green_lane = self._pending_lane
+                self._pending_lane = None
+                self.last_switch_time = now
+            else:
+                return
+
+        if self.current_green_lane is None:
+            default_lane = preferred_lane or "horizontal"
+            self.current_green_lane = default_lane
+            self.last_switch_time = now
+            self._publish_red(self._opposite_lane(self.current_green_lane), show_yellow=False)
+            return
+
+        elapsed = now - self.last_switch_time
+        target_lane = self.current_green_lane
+        should_switch = False
+
+        if elapsed >= self.max_green_time:
+            forced_lane = self._opposite_lane(self.current_green_lane)
+            if forced_lane:
+                target_lane = forced_lane
+                should_switch = True
+        elif preferred_lane and preferred_lane != self.current_green_lane and elapsed >= self.min_green_time:
+            target_lane = preferred_lane
+            should_switch = True
+
+        if should_switch and target_lane != self.current_green_lane:
+            self._schedule_lane_change(target_lane, now)
 
     def draw_osd(self, frame, cam, num_objs):
         """
@@ -393,7 +532,7 @@ class Inferencer:
         # --- Generate text lines ---
         lines = []
         if osd.get("name", False):
-            lines.append(f"Cam: {getattr(cam, 'name', 'Unknown')}")
+            lines.append(f"Cam: {getattr(cam, 'name', 'Unknown')} [{getattr(cam, 'direction', 'X')[0].upper()}]")
         if osd.get("location", False):
             lines.append(f"Loc: {getattr(cam, 'location', 'Unknown')}")
         if osd.get("estimated_congestion", False):
@@ -523,7 +662,10 @@ class Inferencer:
                 results = []
                 if batch_imgs:
                     results = self._batch_infer(model, batch_imgs, device, idx_map)
-
+                if idx_map:
+                    self._last_vehicle_counts = self._aggregate_vehicle_counts(results, idx_map)
+                    self._has_vehicle_measurement = True
+                self._update_signal_state(self._last_vehicle_counts)
                 self._display_frames(frames, results, idx_map)
 
         finally:
@@ -565,7 +707,10 @@ class Inferencer:
                 # Batch infer
                 if batch_imgs:
                     results = self._batch_infer(model, batch_imgs, device, idx_map)
-                
+                if idx_map:
+                    self._last_vehicle_counts = self._aggregate_vehicle_counts(results, idx_map)
+                    self._has_vehicle_measurement = True
+                self._update_signal_state(self._last_vehicle_counts)
                 self._display_frames(frames, results, idx_map)
 
         finally:
@@ -575,37 +720,19 @@ class Inferencer:
                     cam.cap.release()
                 except Exception:
                     pass
+
     def _get_signal_state(self, cam):
         """
-        Determine the light color (green/yellow/red) based on the rotating lane cycle.
-        Only triggers publish() when a *new* lane turns green.
+        Determine the light color (green/yellow/red) for the camera lane based on the current
+        adaptive signal state.
         """
-        elapsed = (time.time() - self.start_time) % self.total_cycle
-        lane_index = int(elapsed // (self.cycle_green + self.cycle_yellow))
-        lane = self.lanes[lane_index]  # active lane this cycle
-        phase_time = elapsed % (self.cycle_green + self.cycle_yellow)
+        direction = getattr(cam, "direction", "vertical")
+        direction = direction if direction in ("horizontal", "vertical") else "vertical"
 
-        # Determine color for the *active* lane
-        if phase_time < self.cycle_green:
-            current_state = "green"
-        else:
-            current_state = "yellow"
-
-        # Determine each camera’s current state
-        cam_index = self.lanes.index(cam.name[-1]) if cam.name[-1] in self.lanes else 0
-        cam_lane = self.lanes[cam_index]
-        state = "red"
-
-        if cam_lane == lane:
-            state = current_state
-
-        # --- Publish event only when the green lane changes ---
-        if current_state == "green" and self.last_green_lane != lane:
-            self.last_green_lane = lane
-            print(f"[INFO] Lane {lane} turned GREEN → publishing to RPi...")
-            try:
-                publish(lane)
-            except Exception as e:
-                print(f"[ERROR] MQTT publish failed for lane {lane}: {e}")
-
-        return state
+        if time.time() < self._yellow_until.get(direction, 0.0):
+            return "yellow"
+        if self.current_green_lane is None:
+            return "red"
+        if direction == self.current_green_lane:
+            return "green"
+        return "red"

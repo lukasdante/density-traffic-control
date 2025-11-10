@@ -18,3 +18,8 @@ def publish(lane: Literal["vertical", "horizontal"]):
 
 if __name__ == "__main__":
     publish("horizontal")
+
+
+# Command
+# mosquitto_pub -h test.mosquitto.org -t "ub-traffic-light/signals/vertical" -m "red"
+# mosquitto_pub -h test.mosquitto.org -t "ub-traffic-light/signals/horizontal" -m "red"

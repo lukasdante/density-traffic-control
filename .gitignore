@@ -16,5 +16,7 @@ chatgpt.py
 videos/
 *.json
 yolo/
+data/
+runs/
 *.pt
 demo/

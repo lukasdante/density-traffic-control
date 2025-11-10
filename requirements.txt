@@ -8,6 +8,7 @@ fsspec==2025.9.0
 gputil==1.4.0
 idna==3.11
 jinja2==3.1.6
+jupyter==1.1.1
 kiwisolver==1.4.9
 lap==0.5.12
 markupsafe==3.0.3
