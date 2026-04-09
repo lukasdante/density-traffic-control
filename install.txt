@@ -1,0 +1,50 @@
+copy files
+uv sync
+activate venv
+pip install -r requirements.txt
+
+do ip link show and find the <name>
+
+add ur ip address of laptop
+sudo ip addr add 192.168.1.200/24 dev <name>
+
+try pinging
+192.168.1.64/65/66/67
+
+SUDO IP ADDR IS TEMPORARY!!! TO MAKE IT PERSISTENT DO THIS
+sudo nmcli connection delete enx00e04c36131a
+sudo nmcli connection add type ethernet con-name "CameraNet" ifname enx00e04c36131a ipv4.method manual ipv4.addresses 192.168.1.200/24
+sudo nmcli connection up "CameraNet"
+ip addr show enx00e04c36131a
+
+THEN INSTALL GSTREAMER
+
+sudo apt-get install gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-plugins-good gstreamer1.0-libav gstreamer1.0-tools
+
+192.168.1.64
+192.168.1.65
+192.168.1.66
+192.168.1.67
+
+Username: admin
+Password: ub-traffic-light
+RTSP Port: 554
+HTTP Port: 80
+HTTPS Port: 443
+
+1. Terminal publishes MQTT data to ESP32 ETXMQC
+2. ESP32 TXMQC sends the data to ESP32 ERX
+
+ETXMQC = espnow transmitter, MQTT client
+ERX = espnow receiver
+
+Configs:
+WIFI_SSID   = ub-hs-2.4G
+WIFI_PASS   = ub-hs-0211
+MQTT_SERVER = test.mosquitto.org
+MQTT_PORT   = 1883
+MQTT_TOPIC  = ub-traffic-light/signals
+ETX_MAC_ADD = 28:56:2F:4A:56:08
+ERX_MAC_ADD = 88:57:21:AD:7C:34
+
+Use 2.4GHz band with phone hotspot, change SSID and password to config above.

@@ -16,9 +16,6 @@ from inference import Inferencer
 from classes import Camera, LatencyTracker, ProxyCamera
 
 asset_path = str(Path(__file__).parent / "assets")
-
-# TODO: Verify camera first before adding to class if it exists
-# TODO: Traffic light logic
 # TODO: SORT tracking
 
 class MainWindow(QMainWindow):
@@ -226,7 +223,7 @@ class MainWindow(QMainWindow):
         else:
             self.layout_settings = {}
 
-    def reset_to_default_settings(self, _, settings=['display','experimental','layout']):
+    def reset_to_default_settings(self, settings=['display','experimental','layout']):
         """ Resets to default settings. """
         if 'display' in settings:
             self.display_settings = {
