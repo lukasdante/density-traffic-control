@@ -1,0 +1,330 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+
+\definecolor{codebg}{rgb}{0.96,0.96,0.96}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true,
+}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\ui}[1]{\textbf{#1}}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+\titleformat{\subsubsection}{\small\bfseries}{\thesubsubsection}{1em}{}
+
+\title{Density-Based Traffic Signal Control \\ \large User Guide --- Navigating and Using the Application}
+\author{Operator manual}
+\date{2026-06-15}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+\bigskip
+
+\section{Introduction}
+This guide explains how to operate the desktop control panel after it has been
+installed (see the Installation Guide). The application detects vehicles in up
+to four camera feeds, decides which of the two traffic lights (the
+\emph{vertical} lane and the \emph{horizontal} lane) should be green, and
+publishes those decisions over MQTT. It also lets emergency vehicles
+(ambulances, firetrucks) preempt the signal.
+
+\subsection{Launching}
+From the repository root, with the virtual environment active:
+\begin{lstlisting}[language=bash]
+source env/bin/activate
+python gui/main.py
+\end{lstlisting}
+The main window opens with the title \ui{Control Panel}. All settings are
+remembered between runs, so on later launches the app reopens with your last
+cameras, layout, and options.
+
+\section{The Main Window at a Glance}
+The window is built from a menu bar, a vertical toolbar on the left, several
+dockable panels, and a status bar along the bottom.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lp{10.5cm}@{}}
+\toprule
+\textbf{Area} & \textbf{Purpose} \\
+\midrule
+Menu bar (top) & \ui{Settings} and \ui{View} menus: load/save configs, reset, toggle panels. \\
+Left toolbar & Add/remove cameras, display settings, edit ROI, experimental settings. \\
+Cameras panel & 2$\times$2 grid of live video with detections and overlays. \\
+System Metrics panel & Clock, CPU/RAM/GPU usage, uptime, FPS, latency breakdown. \\
+Logs panel & Running list of status messages. \\
+Delay Metrics Chart & Capture / inference / display latency over time. \\
+System Metrics Chart & CPU / RAM / GPU usage over time. \\
+Status bar & Short transient messages about the last action. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Docking and the View menu}
+Every panel is a dock that can be moved, floated, resized, or closed. Drag a
+panel's title bar to rearrange it, or drag it out of the window to float it.
+The \ui{View} menu lists each panel with a checkbox to show or hide it, plus
+\ui{Reset layout} to restore the standard arrangement. Your layout is saved
+automatically and restored on the next launch.
+
+\section{The Cameras Panel}
+The Cameras panel shows a 2$\times$2 grid of feeds. The four slots are filled in
+the order your cameras were added: slots~1--2 on the top row, slots~3--4 on the
+bottom row. An empty slot reads \emph{``Missing camera source.''} Drag the
+splitter bars between feeds to resize them.
+
+\subsection{What you see on each feed}
+Depending on the display settings (\S\ref{sec:display}), each feed can show:
+\begin{itemize}[nosep]
+  \item \textbf{Bounding boxes} around detected objects, colour-coded:
+        green = vehicle, yellow = ambulance, red = firetruck.
+  \item \textbf{Labels} (class name and confidence) when annotations are on.
+  \item \textbf{An info overlay} (top-left) with camera name, location, and an
+        estimated congestion ratio.
+  \item \textbf{A traffic-signal indicator} (top-right) showing this lane's
+        current red / yellow / green state.
+  \item \textbf{The region-of-interest outline} when ROI display is enabled.
+\end{itemize}
+
+\section{The Left Toolbar --- Core Actions}
+The toolbar holds the five everyday actions. Each is described below.
+
+\subsection{Add source}
+Opens a dialog to register a new camera. \emph{Which} dialog appears depends on
+the \ui{Use videos} option (\S\ref{sec:experimental}):
+
+\subsubsection{Live camera (RTSP)}
+When \ui{Use videos} is off, the \ui{Add Camera Source} form requests:
+\begin{itemize}[nosep]
+  \item \ui{Camera Name} and \ui{Location} --- free text for identification.
+  \item \ui{Max cap} --- the lane's vehicle capacity, used for the congestion
+        estimate.
+  \item \ui{IP Address} --- validated as a dotted IPv4 address (e.g.\
+        \code{192.168.1.64}).
+  \item \ui{Username} / \ui{Password} --- camera login (password is masked).
+  \item \ui{RTSP Port} --- defaults to \code{554}.
+  \item \ui{Channel} --- defaults to \code{101} (main stream of channel~1 on
+        Hikvision-style cameras).
+  \item \ui{Direction} --- \ui{Vertical} or \ui{Horizontal}; this assigns the
+        camera to one of the two traffic lights.
+\end{itemize}
+The stream URL is assembled as
+\code{rtsp://user:pass@ip:port/Streaming/Channels/channel}. All fields are
+required; click \ui{Add} to save. The detector restarts automatically with the
+new camera.
+
+\subsubsection{Proxy video file}
+When \ui{Use videos} is on, the \ui{Add Proxy Video Source} form requests a
+\ui{Camera Name}, \ui{Location}, \ui{Max cap}, \ui{Direction}, and a
+\ui{Video File} chosen with \ui{Browse} (\code{.mp4}, \code{.avi}, \code{.mkv},
+\code{.mov}). This is the recommended way to demo or test the system without
+live cameras. Video sources loop continuously.
+
+\subsection{Remove source}
+Opens \ui{Remove Camera Source(s)}, showing two checklists side by side:
+\ui{Camera Sources} (live) and \ui{Proxy Camera Sources} (video). Tick any
+combination across both lists and click \ui{Remove Selected}. The detector
+restarts with the remaining sources. \ui{Cancel} discards the selection.
+
+\subsection{Display settings}
+\label{sec:display}
+Opens \ui{Change Display Settings}, which controls only what is \emph{drawn};
+changes apply immediately without restarting the detector. Three groups:
+
+\begin{itemize}[nosep]
+  \item \ui{Bounding Box Display} --- show/hide boxes for \ui{Firetrucks},
+        \ui{Ambulances}, and \ui{Vehicles} independently. Enable firetruck and
+        ambulance boxes when you want to visually confirm emergency detections.
+  \item \ui{On-Screen Display (OSD)} --- toggle each overlay element:
+        \ui{Name}, \ui{Location}, \ui{Estimated Congestion}, \ui{Annotations}
+        (class/confidence labels), \ui{Region of Interests} (the ROI outline),
+        and \ui{Traffic Phase} (the red/yellow/green indicator).
+  \item \ui{Logs} --- the log verbosity level recorded in the Logs panel:
+        \ui{Debug}, \ui{Info}, or \ui{Errors}.
+\end{itemize}
+Click \ui{Save} to apply, \ui{Cancel} to discard.
+
+\subsection{Edit region (ROI)}
+\label{sec:roi}
+A region of interest restricts detection to the part of the frame that is
+actual road, which improves both accuracy and speed. Click \ui{Edit Region},
+pick a camera from the dropdown, and click \ui{OK} to open the ROI editor.
+
+\subsubsection{Using the ROI editor}
+The editor shows a snapshot from that camera with a blue quadrilateral overlay:
+\begin{itemize}[nosep]
+  \item \textbf{Drag a corner handle} (the light-blue squares) to reshape the
+        region.
+  \item \textbf{Drag inside the polygon} to move the whole region.
+  \item The region is clamped to the image bounds.
+  \item Click \ui{Save} to store the ROI (kept as normalised coordinates so it
+        survives resolution changes), or \ui{Cancel} to discard.
+\end{itemize}
+Draw the quadrilateral tightly around the lane(s) feeding the intersection.
+After saving, enable \ui{Region of Interests} in the display settings to see the
+outline on the live feed. Detection thereafter runs only inside this region.
+
+\subsection{Experimental settings}
+\label{sec:experimental}
+Opens \ui{Change Experimental Settings}. Saving here \emph{restarts} the
+detector. Options:
+\begin{itemize}[nosep]
+  \item \ui{Use videos} --- switch the whole app between live RTSP cameras and
+        local video files. This determines which source list is active and which
+        \ui{Add source} dialog appears.
+  \item \ui{Tile Width} / \ui{Tile Height} --- the resolution each feed is
+        processed at. Smaller tiles run faster (useful on a modest GPU such as
+        an RTX~2060); larger tiles detect smaller/farther vehicles more
+        reliably.
+  \item \ui{Model confidence} --- the detection threshold, adjustable from
+        \code{0.00} to \code{1.00} via the slider or the spin box (they stay in
+        sync). Lower values detect more but risk false positives; the default is
+        \code{0.30}.
+\end{itemize}
+
+\section{Monitoring Panels}
+
+\subsection{System Metrics}
+A compact readout updated once per second: current date and time, \ui{CPU},
+\ui{RAM} and \ui{GPU} utilisation bars, \ui{Uptime}, the processing \ui{FPS},
+and a latency breakdown --- \ui{Total Delay} and its \ui{Cam}, \ui{Inf} and
+\ui{Disp} components (capture, inference, and display time in milliseconds).
+FPS is derived as $1/\text{total delay}$.
+
+\subsection{Charts}
+Two live charts plot the same data over time so you can spot trends:
+\begin{itemize}[nosep]
+  \item \ui{Delay Metrics Chart} --- camera, inference, and display latency.
+  \item \ui{System Metrics Chart} --- CPU, RAM, and GPU usage.
+\end{itemize}
+Both keep a rolling window of recent samples.
+
+\subsection{Logs}
+A scrolling, read-only history of status messages (most recent first), mirroring
+what briefly appears in the status bar --- camera additions/removals, detector
+restarts, settings saves, and errors.
+
+\section{The Settings Menu --- Configurations}
+Configurations bundle your cameras, display options, experimental options, and
+window layout into a single JSON file, so you can save and reload complete
+setups (e.g.\ one for the live intersection, one for a video demo).
+
+\begin{itemize}[nosep]
+  \item \ui{Load settings} --- import a configuration from a \code{.json} file
+        and restart the detector with it. Ready-made files live in
+        \code{configs/} (\code{all\_cameras.json} for the live cameras,
+        \code{proxy\_cameras.json} / \code{focus\_first\_camera.json} for video
+        demos).
+  \item \ui{Save settings} --- persist the current state to the app's internal
+        store (also happens automatically on most actions).
+  \item \ui{Save settings as} --- export the current state to a \code{.json}
+        file you choose.
+  \item \ui{Reset to default settings} --- restore default display, experimental
+        and layout settings (your camera list is kept).
+  \item \ui{Reset camera data} --- clear all configured cameras.
+  \item \ui{Quit} --- close the application.
+\end{itemize}
+
+\section{Signal-Control Behaviour (What the App Decides)}
+While running, the app continuously counts vehicles per direction and drives the
+two lights. Understanding this helps interpret the on-screen signal indicator.
+
+\begin{itemize}[nosep]
+  \item \textbf{Density rule} --- the direction with more vehicles is favoured
+        for green; the other is held red.
+  \item \textbf{Minimum green} --- a newly granted green is held briefly before
+        it can switch, preventing rapid flicker when counts are close.
+  \item \textbf{Maximum green} --- a direction cannot hold green indefinitely;
+        after the cap, the other direction is given a turn.
+  \item \textbf{Yellow transition} --- the losing direction shows yellow before
+        going red, then its partner turns green.
+  \item \textbf{Emergency preemption} --- a confirmed ambulance or firetruck
+        forces its lane green immediately, bypassing the minimum-green hold and
+        staying green while the emergency is present. A detection is only
+        ``confirmed'' once it clears the emergency confidence threshold for
+        several consecutive cycles, so a single noisy frame cannot trigger it.
+\end{itemize}
+
+\subsection{Tuning the emergency thresholds}
+The two emergency knobs are \emph{not} in the experimental-settings dialog; they
+are set in the configuration file's \code{experimental\_settings} block and
+applied when the config is loaded:
+\begin{lstlisting}
+"emergency_confidence": 0.55,   // min confidence for an emergency to count
+"emergency_frames": 5           // consecutive cycles required to confirm
+\end{lstlisting}
+Raise \code{emergency\_confidence} or \code{emergency\_frames} if you see false
+preemptions; lower them if genuine emergency vehicles are reacting too slowly.
+To watch this live, enable the \ui{Ambulances} and \ui{Firetrucks} bounding
+boxes in the display settings.
+
+\section{Typical Workflows}
+
+\subsection{Run a video-file demo (no hardware)}
+\begin{enumerate}[nosep]
+  \item \ui{Settings $\rightarrow$ Load settings} and pick
+        \code{configs/proxy\_cameras.json}, \emph{or}\dots
+  \item open \ui{Experimental settings}, tick \ui{Use videos}, \ui{Save}; then
+        use \ui{Add source} to add one or more video files.
+  \item Set a \ui{Direction} for each so both vertical and horizontal lanes are
+        represented.
+  \item Optionally draw an ROI per source (\S\ref{sec:roi}).
+  \item Watch the feeds, the signal indicators, and the metrics panels.
+\end{enumerate}
+
+\subsection{Set up the live intersection}
+\begin{enumerate}[nosep]
+  \item Ensure \ui{Use videos} is off in \ui{Experimental settings}.
+  \item \ui{Add source} for each camera with its IP, credentials, and
+        \ui{Direction} (or load \code{configs/all\_cameras.json}).
+  \item Draw an ROI for each camera over the relevant lanes.
+  \item Tune \ui{Model confidence} and tile size for your GPU.
+  \item Confirm the signal indicators react and that the ESP32 lights follow
+        (see the Installation Guide's smoke test).
+  \item \ui{Settings $\rightarrow$ Save settings as} to store this deployment.
+\end{enumerate}
+
+\subsection{Improve performance on a modest GPU}
+\begin{enumerate}[nosep]
+  \item Lower \ui{Tile Width}/\ui{Height} in \ui{Experimental settings}.
+  \item Draw tight ROIs so inference covers less area.
+  \item Watch the \ui{Inf Delay} in System Metrics and the Delay Metrics Chart;
+        aim for a stable, low inference time and acceptable FPS.
+\end{enumerate}
+
+\section{Tips and Troubleshooting}
+\begin{itemize}[nosep]
+  \item \textbf{A feed says ``Missing camera source''} --- that grid slot has no
+        camera; add one, or the stream/file could not be opened (check the IP,
+        credentials, network, or file path).
+  \item \textbf{Detector seems stuck after changing options} --- adding/removing
+        sources and saving experimental settings restart the detector; give it a
+        moment to reload the model.
+  \item \textbf{Boxes/overlays not showing} --- check the corresponding toggles
+        in \ui{Display settings}; these apply instantly.
+  \item \textbf{Too many/few detections} --- adjust \ui{Model confidence}.
+  \item \textbf{Detections outside the road} --- draw or tighten the ROI.
+  \item \textbf{Lost your layout} --- \ui{View $\rightarrow$ Reset layout}.
+  \item \textbf{Want a clean slate} --- \ui{Settings $\rightarrow$ Reset to
+        default settings} (keeps cameras) or \ui{Reset camera data} (clears
+        cameras).
+\end{itemize}
+
+\end{document}

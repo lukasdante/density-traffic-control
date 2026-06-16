@@ -1,0 +1,206 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+
+\definecolor{codebg}{rgb}{0.96,0.96,0.96}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+
+\title{Density-Based Traffic Signal Control \\ \large Change Log: Broker Migration, Emergency Preemption, and RTX~2060 Performance Tuning}
+\author{Engineering note}
+\date{2026-06-15}
+
+\begin{document}
+\maketitle
+
+\section{Summary}
+This document records the changes made to the density-based traffic signal
+control system in the \texttt{tl} repository. The work covers four areas:
+
+\begin{enumerate}[nosep]
+  \item Migrating the MQTT broker from \texttt{test.mosquitto.org} to
+        \texttt{broker.hivemq.com} across the firmware and documentation.
+  \item Confirming and documenting the two-lane, density-driven signal logic
+        (one light for the vertical lane, one for the horizontal lane).
+  \item Adding \emph{emergency-vehicle preemption}: an ambulance or firetruck
+        forces its lane green, but only once we are confident the detection is
+        real.
+  \item Performance optimizations targeting a client GPU no larger than an
+        NVIDIA RTX~2060 running the smallest YOLO model, while keeping both the
+        live-camera (RTSP) and video-file pipelines intact.
+\end{enumerate}
+
+\section{System Context}
+The pipeline captures video from four IP cameras (or local video files for
+testing), runs a custom-trained YOLO11 detector
+(classes \texttt{ambulance}, \texttt{firetruck}, \texttt{vehicle}), counts
+vehicles per direction, and decides which of the two traffic lights should be
+green. Decisions are published over MQTT to topics
+\texttt{ub-traffic-light/signals/vertical} and
+\texttt{.../horizontal}. An ESP32 subscribed to each topic drives the physical
+lights and coordinates the partner light over ESP-NOW.
+
+\section{1. MQTT Broker Migration to HiveMQ}
+The Python publisher (\texttt{gui/publisher.py}) and the manual test scripts
+already pointed at \texttt{broker.hivemq.com}. The remaining references to
+\texttt{test.mosquitto.org} were updated so the whole system is consistent:
+
+\begin{itemize}[nosep]
+  \item \texttt{esp/bidirectional\_mqtt/bidirectional\_mqtt.ino}
+  \item \texttt{esp/bidirectional\_mqtt\_vertical/bidirectional\_mqtt\_vertical.ino}
+  \item \texttt{esp/bidirectional\_mqtt\_horizontal/bidirectional\_mqtt\_horizontal.ino}
+  \item \texttt{install.txt} (the \texttt{MQTT\_SERVER} configuration line)
+\end{itemize}
+
+\noindent Each \texttt{const char* MQTT\_SERVER} now reads
+\texttt{"broker.hivemq.com"} on port \texttt{1883}. No topic names or client-ID
+logic changed, so the existing firmware behaviour is preserved.
+
+\section{2. Two-Lane Density Logic}
+The intersection has exactly two phases. Cameras are tagged with a
+\texttt{direction} of \texttt{vertical} or \texttt{horizontal}; collinear lanes
+share a phase. Per inference cycle the system sums the \texttt{vehicle}
+detections for each direction and prefers to give green to the busier
+direction:
+
+\begin{lstlisting}
+if vertical_count > horizontal_count:  -> green: vertical
+elif horizontal_count > vertical_count: -> green: horizontal
+else:                                    -> hold current phase
+\end{lstlisting}
+
+\noindent Two timing guards keep the lights sane and safe:
+\begin{itemize}[nosep]
+  \item \textbf{Minimum green} (\texttt{MIN\_GREEN}, 15\,s): the system will not
+        switch away from a freshly granted green until this elapses, preventing
+        flicker when counts are close.
+  \item \textbf{Maximum green} (\texttt{MAX\_GREEN}, 85\,s): if one direction has
+        held green this long, the opposite direction is forced green to avoid
+        starvation.
+\end{itemize}
+
+\noindent Every phase change is mediated by a 3\,s yellow transition on the
+lane losing priority, after which its partner light is told to go green.
+
+\section{3. Emergency-Vehicle Preemption}
+\subsection{Goal}
+If an ambulance or firetruck is present in a lane, that lane should turn green
+immediately. However, a single noisy frame must \emph{not} hijack the
+intersection, so a detection only counts as an emergency once we are confident
+it is genuine.
+
+\subsection{Confidence gate}
+A detection is treated as a candidate emergency only if its class is
+\texttt{ambulance} or \texttt{firetruck} \emph{and} its confidence is at least
+\texttt{EMERGENCY\_CONFIDENCE} (default \texttt{0.55}, higher than the
+\texttt{0.30} used for ordinary vehicle counting).
+
+\subsection{Persistence gate}
+Per cycle, each lane's count of confident emergency detections updates a
+\emph{streak} counter: the streak increments while emergencies are seen and
+resets to zero the moment a lane shows none. A lane is only declared a
+confirmed emergency once its streak reaches \texttt{EMERGENCY\_FRAMES}
+(default \texttt{5} consecutive cycles). This rejects isolated false positives
+while still reacting within a fraction of a second at typical frame rates.
+
+\subsection{Preemption behaviour}
+When a lane is confirmed:
+\begin{itemize}[nosep]
+  \item It is switched green immediately, \textbf{bypassing the minimum-green
+        hold} on the current phase.
+  \item While its emergency remains active it is \textbf{exempt from the
+        maximum-green timeout}, so it stays green until the emergency vehicle
+        clears.
+  \item The 3\,s yellow transition on the losing lane is still honoured for
+        safety.
+  \item If both lanes show confirmed emergencies simultaneously, the currently
+        green lane is held; otherwise the lane with more emergency detections
+        wins.
+\end{itemize}
+
+\subsection{Tuning}
+Both thresholds are configurable per deployment via the
+\texttt{experimental\_settings} block in the camera config files
+(\texttt{emergency\_confidence}, \texttt{emergency\_frames}) and are applied
+live when settings change. The detector classes \texttt{ambulance} and
+\texttt{firetruck} can be enabled in the on-screen bounding-box overlay for
+visual verification.
+
+\section{4. Performance Optimizations (RTX~2060, Smallest Model)}
+The clients run on a GPU no larger than an RTX~2060 with the smallest YOLO
+weights, so the goal was to cut per-frame overhead without changing detection
+behaviour.
+
+\subsection{Eliminated redundant GPU$\rightarrow$CPU transfers}
+Previously each frame's detections were pulled off the GPU as separate
+\texttt{xyxy}, \texttt{conf}, and \texttt{cls} tensors in the display path, the
+counting path performed its own \texttt{cls} transfer, and the inference helper
+computed shifted coordinates that were then \emph{discarded}. The detections
+are now transferred \textbf{once} per frame as a single
+\texttt{(N,6)} array \texttt{[x1,y1,x2,y2,conf,cls]}, already shifted into
+full-frame coordinates, and cached. Both the signal logic and the renderer read
+this cache. The dead transfer was removed entirely. On four cameras this
+removes several host/device synchronisations per cycle, the most costly
+non-inference work in the loop.
+
+\subsection{cuDNN autotuning, TF32, and FP16}
+Because the inference tile size is fixed frame-to-frame, cuDNN benchmarking is
+enabled so it caches the fastest convolution kernels. TF32 matmul/convolution
+paths are enabled, and the model is fused and run in FP16 on the GPU. These are
+low-risk wins well suited to Turing-class hardware.
+
+\subsection{Warm-up inference}
+A single dummy inference is run at startup so the first real frame no longer
+pays the one-off kernel-compilation and allocator stall. This also makes the
+reported latency reflect steady-state performance.
+
+\subsection{Correct per-camera ROI indexing}
+The region-of-interest cropping now uses each frame's true camera index rather
+than its position within the (possibly shorter) batch. This fixes a latent bug
+where a dropped camera frame would apply the wrong ROI, and keeps inference
+confined to the relevant road area.
+
+\subsection{Shared pipeline path (\emph{the other implementation, kept})}
+The repository has two capture paths: live RTSP cameras and local video files
+(used for testing/demo). Both were retained. Their per-cycle processing
+(batching, inference, signal update, rendering) was de-duplicated into a single
+\texttt{\_process\_frames} helper, so both paths now share the identical,
+optimized code and cannot drift apart. The video-file path additionally
+benefits from all the optimizations above.
+
+\section{Files Changed}
+\begin{itemize}[nosep]
+  \item \texttt{gui/inference.py} --- emergency preemption, single-transfer
+        detection cache, cuDNN/TF32/FP16 setup, warm-up, ROI index fix, shared
+        \texttt{\_process\_frames} helper, live-tunable thresholds.
+  \item \texttt{gui/publisher.py} --- already on HiveMQ (no change required).
+  \item \texttt{esp/*/*.ino} --- broker set to \texttt{broker.hivemq.com}.
+  \item \texttt{configs/*.json} --- added \texttt{emergency\_confidence} and
+        \texttt{emergency\_frames} to \texttt{experimental\_settings}.
+  \item \texttt{install.txt} --- broker documentation updated.
+\end{itemize}
+
+\section{Validation Notes}
+Python modules were syntax-checked and the configuration files were validated
+as JSON. End-to-end behaviour (live detection latency on the RTX~2060 and the
+emergency override against real ambulance/firetruck footage) should be
+confirmed on the target hardware, and \texttt{EMERGENCY\_CONFIDENCE} /
+\texttt{EMERGENCY\_FRAMES} tuned to the deployed camera frame rate.
+
+\end{document}

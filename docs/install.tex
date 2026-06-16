@@ -1,0 +1,391 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+
+\definecolor{codebg}{rgb}{0.96,0.96,0.96}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true,
+}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+
+\title{Density-Based Traffic Signal Control \\ \large Installation Guide --- Hardware and Software}
+\author{Deployment manual}
+\date{2026-06-15}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+\bigskip
+
+\section{Overview}
+The system has three cooperating parts:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Cameras} --- four IP cameras stream video over RTSP on a wired
+        network.
+  \item \textbf{Workstation} --- a Linux/GPU machine runs the PySide6
+        application, detects vehicles with YOLO11, decides the phase for the
+        two lights (vertical and horizontal lanes) and publishes commands over
+        MQTT.
+  \item \textbf{Traffic lights} --- two ESP32 boards, one per lane, subscribe to
+        their MQTT topic, drive the red/yellow/green outputs, and hand the green
+        phase to each other over ESP-NOW.
+\end{enumerate}
+
+\noindent Data flow:
+\begin{center}
+\code{Cameras} $\rightarrow$ \code{Workstation (YOLO + logic)} $\rightarrow$
+\code{MQTT broker (broker.hivemq.com)} $\rightarrow$ \code{ESP32 lights}
+$\leftrightarrow$ \code{ESP-NOW}
+\end{center}
+
+\noindent The MQTT broker is the public \code{broker.hivemq.com} on port
+\code{1883}, so both the workstation and the ESP32 boards need Internet access.
+The cameras live on a separate, isolated wired network.
+
+\section{Bill of Materials}
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Item} & \textbf{Qty} & \textbf{Notes} \\
+\midrule
+GPU workstation & 1 & Ubuntu 22.04, NVIDIA GPU (RTX~2060 or better) \\
+IP cameras (RTSP) & 4 & Hikvision-compatible, PoE \\
+PoE switch & 1 & To power and network the cameras \\
+USB-to-Ethernet adapter & 1 & Dedicated NIC for the camera network \\
+Ethernet cables & 5 & Cameras + uplink \\
+ESP32 dev boards & 2 & One per lane (vertical, horizontal) \\
+Traffic-light LEDs/relays & 2 sets & Red, yellow, green per lane \\
+Resistors / relay board & --- & For LEDs or to switch mains lamps \\
+2.4\,GHz Wi-Fi hotspot & 1 & Phone hotspot is fine (see \S\ref{sec:hotspot}) \\
+Jumper wires, breadboard / PCB & --- & For ESP32 wiring \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Part A --- Workstation (Software)}
+
+\subsection{Install Ubuntu 22.04}
+Install Ubuntu 22.04 LTS on the GPU machine. During installation, tick
+\emph{``Install third-party software for graphics and Wi-Fi hardware\ldots''}
+so the NVIDIA driver is set up automatically. After first boot, confirm the GPU
+is visible:
+\begin{lstlisting}[language=bash]
+nvidia-smi
+\end{lstlisting}
+You should see your GPU and driver version. If the command is missing, install
+the recommended driver and reboot:
+\begin{lstlisting}[language=bash]
+sudo ubuntu-drivers autoinstall
+sudo reboot
+\end{lstlisting}
+
+\subsection{Install system dependencies}
+The capture pipeline uses GStreamer through PyGObject, and the test scripts use
+the Mosquitto client tools. Install them system-wide:
+\begin{lstlisting}[language=bash]
+sudo apt update
+sudo apt install -y git curl \
+  python3-gi python3-gi-cairo gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+  gstreamer1.0-libav gstreamer1.0-tools \
+  mosquitto-clients
+\end{lstlisting}
+
+\noindent The application imports the system GStreamer bindings from
+\code{/usr/lib/python3/dist-packages}, so \code{python3-gi} and the GStreamer
+plugins above must be present even though the rest of the app runs in a virtual
+environment.
+
+\subsection{Install \texttt{uv} and clone the repository}
+\begin{lstlisting}[language=bash]
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# restart the shell or: source $HOME/.local/bin/env
+
+cd ~
+mkdir -p project && cd project
+git clone https://github.com/lukasdante/density-traffic-control.git
+cd density-traffic-control
+\end{lstlisting}
+If \code{git} prompts for a username/email, set the global config it asks for,
+then re-run the \code{git clone} line.
+
+\subsection{Create the virtual environment and install requirements}
+\begin{lstlisting}[language=bash]
+uv venv env
+source env/bin/activate     # prompt now shows (env)
+uv pip install -r requirements.txt
+\end{lstlisting}
+This pulls in PyTorch (CUDA 12 build), Ultralytics, OpenCV, PySide6 and the
+other dependencies. Verify CUDA is available to PyTorch:
+\begin{lstlisting}[language=bash]
+python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+\end{lstlisting}
+It should print \code{CUDA: True}. If it prints \code{False}, re-check the
+NVIDIA driver (\code{nvidia-smi}).
+
+\subsection{Confirm the model weights are present}
+The detector loads \code{model/runs/yolo11-vehicles2/weights/best.pt}. Confirm
+it exists:
+\begin{lstlisting}[language=bash]
+ls model/runs/yolo11-vehicles2/weights/
+\end{lstlisting}
+If the weights are not in the clone, copy them into that path before running.
+
+\section{Part B --- Camera Network}
+
+\subsection{Wire the cameras}
+Connect the four cameras and the workstation's USB-to-Ethernet adapter to the
+PoE switch. The cameras use the fixed addresses below.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Camera} & \textbf{IP address} & \textbf{Lane (direction)} \\
+\midrule
+Camera A & 192.168.1.64 & vertical \\
+Camera B & 192.168.1.65 & vertical \\
+Camera C & 192.168.1.66 & horizontal \\
+Camera D & 192.168.1.67 & horizontal \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Camera credentials (RTSP):
+\begin{itemize}[nosep]
+  \item Username: \code{admin}
+  \item Password: \code{ub-traffic-light}
+  \item RTSP port: \code{554}\quad(HTTP \code{80}, HTTPS \code{443})
+\end{itemize}
+
+\subsection{Give the workstation a static IP on the camera subnet}
+Find the name of the Ethernet adapter:
+\begin{lstlisting}[language=bash]
+ip link show
+\end{lstlisting}
+Look for the wired device, typically named like \code{enx00e04c36131a}. Assign a
+\emph{temporary} static IP to test connectivity (replace \code{<name>}):
+\begin{lstlisting}[language=bash]
+sudo ip addr add 192.168.1.200/24 dev <name>
+ping 192.168.1.64   # repeat for .65 .66 .67
+\end{lstlisting}
+
+\subsection{Make the static IP persistent}
+The \code{ip addr add} above is lost on reboot. Make it permanent with
+NetworkManager (replace \code{enx00e04c36131a} with your adapter name):
+\begin{lstlisting}[language=bash]
+sudo nmcli connection delete enx00e04c36131a
+sudo nmcli connection add type ethernet con-name "CameraNet" \
+  ifname enx00e04c36131a ipv4.method manual ipv4.addresses 192.168.1.200/24
+sudo nmcli connection up "CameraNet"
+ip addr show enx00e04c36131a
+\end{lstlisting}
+Verify you can still ping all four cameras after this step.
+
+\section{Part C --- 2.4\,GHz Hotspot for the ESP32 Lights}
+\label{sec:hotspot}
+The ESP32 only supports 2.4\,GHz Wi-Fi. The boards (and the broker they talk to)
+need Internet, so the simplest setup is a phone hotspot forced to the 2.4\,GHz
+band, configured with the credentials the firmware expects.
+
+\subsection{Firmware-expected credentials}
+The shipped firmware connects to:
+\begin{itemize}[nosep]
+  \item SSID: \code{ub-hs-2.4G}
+  \item Password: \code{ub-hs-0211}
+\end{itemize}
+Either configure your hotspot to use exactly these values, \emph{or} change
+\code{WIFI\_SSID} / \code{WIFI\_PASS} in both ESP sketches to match your
+hotspot (see Part~D).
+
+\subsection{Force the hotspot to 2.4\,GHz (Android)}
+\begin{enumerate}[nosep]
+  \item Settings $\rightarrow$ \emph{Network \& Internet} $\rightarrow$
+        \emph{Hotspot \& tethering} $\rightarrow$ \emph{Wi-Fi hotspot}.
+  \item Set \emph{Hotspot name} to \code{ub-hs-2.4G} and \emph{Password} to
+        \code{ub-hs-0211}.
+  \item Set \emph{AP Band} to \emph{2.4 GHz} (do not use ``Auto'' or 5\,GHz).
+  \item Enable the hotspot.
+\end{enumerate}
+On iPhone, enable \emph{Personal Hotspot} and turn on
+\emph{Maximize Compatibility} to force 2.4\,GHz; note that iOS does not let you
+set an arbitrary SSID, so you will need to edit the firmware credentials to
+match the iPhone's hotspot name and password.
+
+\subsection{Connect the workstation to the same hotspot}
+The workstation publishes to \code{broker.hivemq.com} over the Internet, so
+connect its Wi-Fi to the same hotspot (the wired \code{CameraNet} interface
+stays dedicated to the cameras). The machine therefore has two networks at once:
+wired for cameras, Wi-Fi for Internet/MQTT.
+
+\section{Part D --- ESP32 Traffic Lights (Hardware + Firmware)}
+
+\subsection{Wiring}
+Each ESP32 drives one light. The outputs are \textbf{active-LOW} (a pin driven
+\code{LOW} turns its lamp \emph{on}):
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Signal} & \textbf{ESP32 GPIO} \\
+\midrule
+Red & 27 \\
+Yellow & 26 \\
+Green & 25 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent For LED indicators, wire each GPIO through a current-limiting resistor
+(e.g.\ 220--330\,$\Omega$) to the LED, LED cathode to GND. To switch real
+traffic lamps, drive an opto-isolated relay board from these pins and observe
+the active-LOW polarity (most relay boards are also active-LOW, which matches).
+Power the ESP32 from a stable 5\,V USB supply.
+
+\subsection{Install the Arduino IDE and ESP32 support}
+\begin{enumerate}[nosep]
+  \item Install the Arduino IDE (2.x).
+  \item \emph{File $\rightarrow$ Preferences $\rightarrow$ Additional Boards
+        Manager URLs}, add:\\
+        \url{https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json}
+  \item \emph{Tools $\rightarrow$ Board $\rightarrow$ Boards Manager}, install
+        \emph{esp32 by Espressif Systems}.
+  \item \emph{Tools $\rightarrow$ Manage Libraries}, install \emph{PubSubClient}
+        by Nick O'Leary. (\code{WiFi} and \code{esp\_now} ship with the ESP32
+        core.)
+\end{enumerate}
+
+\subsection{Find each board's MAC address}
+The two boards reference each other by MAC, so record them first. Open either
+sketch, select \emph{Tools $\rightarrow$ Board $\rightarrow$ ESP32 Dev Module},
+pick the serial \emph{Port}, upload, then open \emph{Serial Monitor} at
+\code{115200} baud and reset the board. It prints its MAC, e.g.\
+\code{[Wi-Fi] Connected, IP: \ldots | MAC: 88:57:21:AD:7C:34}.
+
+\subsection{Flash the two sketches}
+There is one sketch per lane. Each must (a) subscribe to its own MQTT topic and
+(b) point its ESP-NOW \code{peerAddress} at the \emph{other} board's MAC.
+
+\begin{itemize}[nosep]
+  \item \textbf{Vertical light} ---
+        \code{esp/bidirectional\_mqtt\_vertical/bidirectional\_mqtt\_vertical.ino}\\
+        Topic: \code{ub-traffic-light/signals/vertical};\quad
+        \code{peerAddress} = MAC of the \emph{horizontal} board.
+  \item \textbf{Horizontal light} ---
+        \code{esp/bidirectional\_mqtt\_horizontal/bidirectional\_mqtt\_horizontal.ino}\\
+        Topic: \code{ub-traffic-light/signals/horizontal};\quad
+        \code{peerAddress} = MAC of the \emph{vertical} board.
+\end{itemize}
+
+\noindent In each sketch confirm/adjust the configuration block at the top:
+\begin{lstlisting}
+const char* WIFI_SSID   = "ub-hs-2.4G";          // match your hotspot
+const char* WIFI_PASS   = "ub-hs-0211";          // match your hotspot
+const char* MQTT_SERVER = "broker.hivemq.com";   // already set
+const int   MQTT_PORT   = 1883;
+const char* MQTT_TOPIC  = "ub-traffic-light/signals/vertical"; // or /horizontal
+uint8_t peerAddress[] = { /* MAC of the OTHER ESP32 */ };
+\end{lstlisting}
+Upload each sketch to its board. The \code{bidirectional\_mqtt} sketch (no
+suffix) is a reference MQTT$\rightarrow$ESP-NOW forwarder and is \emph{not}
+needed for the two-light deployment.
+
+\subsection{How the lights coordinate}
+The workstation only ever publishes \code{"red"} to the lane that should lose
+priority. That board turns yellow for 3\,s, then tells its peer to go
+\code{"green"} over ESP-NOW, then turns itself red. Each board also enforces a
+hardware safety cap (\code{MAX\_GREEN\_SECONDS = 90}) so no lamp can stay green
+indefinitely if a command is missed.
+
+\section{Part E --- Running the System}
+
+\subsection{Smoke-test the light link (no cameras needed)}
+With both ESP32 boards powered and on the hotspot, publish a command from the
+workstation and watch the lamps and Serial Monitor:
+\begin{lstlisting}[language=bash]
+# from the repo root, with the venv active
+./vertical_test.sh      # publishes "red" to the vertical topic
+./horizontal_test.sh    # publishes "red" to the horizontal topic
+
+# or directly:
+python gui/publisher.py vertical red
+mosquitto_pub -h broker.hivemq.com -p 1883 \
+  -t "ub-traffic-light/signals/vertical" -m "red"
+\end{lstlisting}
+You should see the addressed lane go yellow then red, and the other lane go
+green.
+
+\subsection{Launch the application}
+\begin{lstlisting}[language=bash]
+cd ~/project/density-traffic-control
+source env/bin/activate
+python gui/main.py
+\end{lstlisting}
+
+\subsection{Load a configuration}
+Ready-made configs live in \code{configs/}:
+\begin{itemize}[nosep]
+  \item \code{all\_cameras.json} --- the four live RTSP cameras.
+  \item \code{proxy\_cameras.json} / \code{focus\_first\_camera.json} ---
+        local video files for testing without hardware
+        (\code{use\_videos: true}).
+\end{itemize}
+Load the appropriate config from the GUI, then start inference. The grid shows
+each camera, detected vehicles, and (when enabled in the OSD settings) the
+current signal phase per lane.
+
+\subsection{Tuning detection and emergency behaviour}
+Key knobs in the config \code{experimental\_settings} block:
+\begin{itemize}[nosep]
+  \item \code{confidence} (default 0.30) --- detection threshold for vehicles.
+  \item \code{tile\_w} / \code{tile\_h} --- per-camera inference resolution;
+        lower values trade accuracy for speed on weaker GPUs.
+  \item \code{emergency\_confidence} (default 0.55) --- minimum confidence for
+        an ambulance/firetruck to count toward an emergency.
+  \item \code{emergency\_frames} (default 5) --- consecutive cycles an emergency
+        must persist before that lane is forced green.
+\end{itemize}
+To watch emergency detections, enable the \code{ambulance} and \code{firetruck}
+bounding boxes in the display settings.
+
+\section{Troubleshooting}
+\begin{itemize}[nosep]
+  \item \textbf{\code{torch.cuda.is\_available()} is False} --- NVIDIA driver
+        not loaded; run \code{nvidia-smi}, reinstall the driver, reboot.
+  \item \textbf{\code{No module named gi}} --- install \code{python3-gi} and the
+        GStreamer packages (\S A.2); they must be present system-wide.
+  \item \textbf{Cameras unreachable} --- confirm the \code{CameraNet} static IP
+        with \code{ip addr show} and \code{ping 192.168.1.64}; check the PoE
+        switch.
+  \item \textbf{ESP32 won't connect to Wi-Fi} --- the hotspot must be 2.4\,GHz
+        and the SSID/password must match the firmware exactly; watch the Serial
+        Monitor at 115200.
+  \item \textbf{Lights don't switch} --- verify both boards are online
+        (Serial Monitor shows \emph{Subscribed}), that each \code{peerAddress}
+        is the \emph{other} board's MAC, and that a manual
+        \code{mosquitto\_pub} toggles them.
+  \item \textbf{Lamp polarity inverted} --- the outputs are active-LOW; swap LED
+        wiring or relay logic accordingly.
+\end{itemize}
+
+\end{document}

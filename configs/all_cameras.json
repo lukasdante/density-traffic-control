@@ -1,0 +1,79 @@
+{
+    "cameras": [
+        {
+            "name": "IP Camera A",
+            "location": "A",
+            "max_cap": "100",
+            "ip_address": "192.168.1.64",
+            "username": "admin",
+            "password": "ub-traffic-light",
+            "rtsp_port": 554,
+            "channel": 101,
+            "direction": "vertical",
+            "roi": null
+        },
+        {
+            "name": "IP Camera B",
+            "location": "B",
+            "max_cap": "150",
+            "ip_address": "192.168.1.65",
+            "username": "admin",
+            "password": "ub-traffic-light",
+            "rtsp_port": 554,
+            "channel": 101,
+            "direction": "vertical",
+            "roi": null
+        },
+        {
+            "name": "IP Camera C",
+            "location": "C",
+            "max_cap": "200",
+            "ip_address": "192.168.1.66",
+            "username": "admin",
+            "password": "ub-traffic-light",
+            "rtsp_port": 554,
+            "channel": 101,
+            "direction": "horizontal",
+            "roi": null
+        },
+        {
+            "name": "IP Camera D",
+            "location": "D",
+            "max_cap": "200",
+            "ip_address": "192.168.1.67",
+            "username": "admin",
+            "password": "ub-traffic-light",
+            "rtsp_port": 554,
+            "channel": 101,
+            "direction": "horizontal",
+            "roi": null
+        }
+    ],
+    "proxy_cameras": [],
+    "display_settings": {
+        "bounding_boxes": {
+            "firetruck": true,
+            "ambulance": true,
+            "vehicle": true
+        },
+        "osd": {
+            "name": true,
+            "location": false,
+            "estimated_congestion": true,
+            "annotations": true,
+            "roi": false,
+            "traffic_phase": true
+        },
+        "logs": {
+            "log_level": "Info"
+        }
+    },
+    "experimental_settings": {
+        "use_videos": false,
+        "tile_w": 640,
+        "tile_h": 360,
+        "confidence": 0.3,
+        "emergency_confidence": 0.55,
+        "emergency_frames": 5
+    }
+}

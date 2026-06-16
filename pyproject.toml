@@ -1,0 +1,18 @@
+[project]
+name = "density-traffic-control"
+version = "0.1.0"
+description = "Density-based traffic signal control with YOLOv12, GStreamer/RTSP, and ESP32 over MQTT."
+readme = "README.md"
+requires-python = ">=3.10.12"
+dependencies = [
+    "ultralytics==8.3.213",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "opencv-python==4.11.0.86",
+    "numpy==1.26.4",
+    "pyside6==6.10.0",
+    "pyqtgraph==0.13.7",
+    "psutil==7.1.0",
+    "gputil==1.4.0",
+    "paho-mqtt==2.1.0",
+]

@@ -1,0 +1,36 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- Virtual environments ---
+.venv/
+env/
+
+# --- Heavy data (host on Google Drive, NOT in git) ---
+tl-data/
+videos/
+model/data/
+model/runs/
+LOST.DIR/
+System Volume Information/
+
+# --- Pretrained weight downloads (auto-fetched during training) ---
+*.pt
+
+# --- Dev-only / personal configs (point at local files) ---
+configs/proxy_cameras.json
+configs/focus_first_camera.json
+
+# --- Agent / editor scratch ---
+.agents/
+.codex/
+codex.txt
+install.txt
+
+# --- LaTeX build artifacts ---
+*.aux
+*.log
+*.out
+*.toc
